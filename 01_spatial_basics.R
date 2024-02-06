@@ -32,6 +32,10 @@ seattle_destinations_table <- read.csv(
 )
 table(seattle_destinations_table$type)
 
+# If lines 27 or 30 are too slow, you can also read these from the tutorial folder:
+# seattle_neighborhoods <- sf::st_read("MaptimeSEA Tutorial 2024-02/seattle_neighborhoods.gpkg")
+# seattle_destinations_table <- read.csv("MaptimeSEA Tutorial 2024-02/seattle_destinations_table.csv")
+
 
 ## Load census data --------------------------------------------------------------------->
 
@@ -49,9 +53,14 @@ kc_blocks <- tidycensus::get_decennial(
   geometry = TRUE,
   cache_table = TRUE
 )
+# If the line above is too slow, you can also read this object from the tutorial folder
+# kc_blocks <- sf::st_read("MaptimeSEA Tutorial 2024-02/king_county_blocks.gpkg")
+
+# Rename the 'value' column to 'total_pop'
 names(kc_blocks)[names(kc_blocks) == 'value'] <- 'total_pop'
 
 # Inspect the blocks in RStudio
+View(kc_blocks)
 
 # See the current CRS for the blocks
 sf::st_crs(kc_blocks)
@@ -60,8 +69,9 @@ sf::st_crs(kc_blocks)
 kc_blocks <- sf::st_transform(kc_blocks, crs = working_crs)
 
 # Get population density for each block
-# TODO: MENTION NEW PIPE
 kc_blocks$area_km2 <- sf::st_area(kc_blocks) |> units::set_units('km2') |> units::drop_units()
+# The following commented line is equivalent to the one above, but harder to read:
+# kc_blocks$area_km2 <- units::drop_units(units::set_units(sf::st_area(kc_blocks), 'km2'))
 
 kc_blocks$pop_density <- kc_blocks$total_pop / kc_blocks$area_km2
 
@@ -86,6 +96,9 @@ seattle_blocks <- sf::st_intersection(
   y = seattle_neighborhoods[, c('L_HOOD', 'S_HOOD')]
 )
 
+# Inspect the Seattle blocks object
+View(seattle_blocks)
+
 
 ## Visualize census data ---------------------------------------------------------------->
 
@@ -102,9 +115,11 @@ mapview::mapview(
 
 # Improve the color scheme
 color_breaks <- c(-Inf, 5000, 10000, 25000, 50000, Inf)
+color_labels <- c("<5k", "5-10k", "10-25k", "25-50k", ">50k")
 seattle_blocks$color_bin <- cut(
   x = seattle_blocks$pop_density,
-  breaks = color_breaks
+  breaks = color_breaks,
+  labels = color_labels
 )
 mapview::mapview(
   seattle_blocks,
@@ -119,7 +134,7 @@ ggplot_map <- ggplot() +
   geom_sf(data = seattle_neighborhoods, color = 'grey80', linewidth = 0.05, fill = NA) +
   scale_fill_viridis(
     trans = 'sqrt',
-    breaks = c(0, 5000, 10000, 25000, 50000),
+    breaks = c(0, 2500, 10000, 25000, 50000),
     labels = scales::comma,
     limits = c(0, 50000)
   ) +
@@ -136,13 +151,13 @@ print(ggplot_map)
 ggplot_map_with_destinations <- ggplot_map +
   geom_sf(data = seattle_destination_points, aes(color = type), size = 1, alpha = .75) +
   scale_color_manual(
-    values = c(Restaurants = 'red', 'Coffee shops' = 'darkorange', Supermarkets = '#cc66ff')
+    values = c(Restaurants = 'red', 'Coffee shops' = 'darkorange', Supermarkets = '#ff33ff')
   ) +
   labs(color = 'Destination type')
 print(ggplot_map_with_destinations)
 
 # Save it to file
-png('~/seattle_density_map.png', height = 2100, width = 1500, res = 300)
+png('seattle_density_map.png', height = 2100, width = 1500, res = 300)
 print(ggplot_map)
 dev.off()
 
@@ -178,26 +193,62 @@ block_centroids_unprojected$x <- sf::st_coordinates(block_centroids_unprojected)
 block_centroids_unprojected$y <- sf::st_coordinates(block_centroids_unprojected)[, 'Y']
 
 # Split into training and test datasets
+# Include only populated blocks for this example
 full_dataset <- as.data.frame(block_centroids_unprojected)
+full_dataset <- full_dataset[full_dataset$pop_density > 0, ]
+
 train_index <- caret::createDataPartition(full_dataset$L_HOOD, p = .8, list = F, times = 1)
 training_data <- full_dataset[train_index, ]
-test_data <- full_dataset[!train_index, ]
+test_data <- full_dataset[-train_index, ]
 
-# Run a random forest regression on the training data
+
+## COMPARE PREDICTIVE PERFORMANCE OF SEVERAL ML MODELS ---------------------------------->
+
 # For more information about regression models available in caret:
 # https://topepo.github.io/caret/available-models.html
-model_fit <- caret::train(
-  pop_density ~ x + y + restaurants + coffee + supermarkets + L_HOOD,
-  data = training_data,
-  method = 'enet' # Try also: 'randomForest', 'svmRadial', 'xgbTree'
+model_options <- list(
+  lm = list(),
+  enet = list(lambda = 0.25),
+  svmRadial = list(sigma = 0.1),
+  xgbTree = list(nrounds = 4, max_depth = 2, eta = 0.7),
+  rf = list(mtry = 5)
+)
+# Try also: 'enet', 'svmRadial', 'xgbTree', 'rf'
+test_model_type <- 'lm'
+
+# Run a regression model on the training data
+model_fit <- do.call(
+  what = caret::train,
+  args = c(
+    list(
+      form = pop_density ~ x + y + restaurants + coffee + supermarkets + L_HOOD,
+      data = training_data,
+      method = test_model_type
+    ),
+    model_options[[test_model_type]]
+  )
 )
 
 # See how well the model predicts the remaining 20% of data
 test_data$predictions <- predict(model_fit, newdata = test_data)
 
+r_squared <- cor(test_data$pop_density, test_data$predictions)
+rmse <- (test_data$pop_density - test_data$predictions)**2 |> mean(na.rm = T) |> sqrt()
+
 # Plot the results
-ggplot(data = test_data) +
-  geom_point(aes(x = pop_density, y = predictions, color = L_HOOD)) +
-  scale_x_continuous(trans = sqrt) +
-  scale_y_continuous(trans = sqrt) +
+results_plot <- ggplot(data = test_data, aes(x = predictions, y = pop_density)) +
+  geom_point(aes(color = L_HOOD)) +
+  geom_abline(intercept = 0, slope = 1, color = '#222222', linetype = 3, linewidth = 1) +
+  geom_smooth(method = 'loess', span = .3) +
+  scale_x_continuous(trans = 'sqrt', labels = scales::comma) +
+  scale_y_continuous(trans = 'sqrt', labels = scales::comma) +
+  labs(
+    title = paste('Out-of-sample performance for model type:', toupper(test_model_type)),
+    subtitle = paste('RMSE:', scales::comma(rmse), '| R-squared:', round(r_squared, 2)),
+    x = 'Population density (predicted)',
+    y = 'Population density (actual)',
+    color = 'Neighborhood'
+  ) +
+  guides(color = guide_legend(ncol = 2)) +
   theme_bw()
+print(results_plot) |> suppressWarnings()
