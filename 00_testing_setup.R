@@ -31,7 +31,7 @@ proj_search_paths <- sf::sf_proj_search_paths()
 if(any('proj.db' %in% list.files(proj_search_paths))){
   message("SF is connected to proj")
 } else {
-  message("SF could not find the proj database")
+  stop("SF could not find the proj database")
 }
 # If check 4 fails: add the following line to the top of the script and re-run
 # sf::sf_proj_search_paths(path = "/my/proj/install/path/")
@@ -41,6 +41,8 @@ if(any('proj.db' %in% list.files(proj_search_paths))){
 rjava_startup_code <- rJava::.jinit()
 if(rjava_startup_code != 0L) stop("rJava failed to start")
 linked_java_version <- rJava::.jcall("java.lang.System", "S", "getProperty", "java.version")
-if(!grepl('^21', linked_java_version)){
-  stop("Linked Java version is ", linked_java_version, ", does not start with 21")
+if(grepl('^21', linked_java_version)){
+  message("Linked Java version is ", linked_java_version, ", as expected.")
+} else {
+  stop("Linked Java version is ", linked_java_version, ", does not start with 21.")
 }
