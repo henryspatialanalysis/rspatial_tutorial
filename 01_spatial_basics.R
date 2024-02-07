@@ -253,11 +253,12 @@ test_data <- full_dataset[-train_index, ]
 #
 # Some model options, approximately ordered by run times:
 #   - 'lm': Linear regression
+#   - 'glm': Generalized linear models
 #   - 'ridge', 'enet': Penalized regression
 #   - 'rpart': Regression trees
-#   - 'glm': Generalized linear models
 #   - 'gam': Generalized additive model
 #   - 'gbm': Stochastic gradient boosting
+#   - 'blackboost': Boosted GAMs
 #   - 'treebag': Bagged regression trees
 #   - 'svmLinear', 'svmLinear2', 'svmPoly', 'svmRadial': support vector machines
 #   - 'xgbLinear', 'xgbDART', 'xgbTree': XGBoost
@@ -267,7 +268,7 @@ test_data <- full_dataset[-train_index, ]
 # Some models have tuning parameters where you can override the defaults. For more
 #  information, see caret::modelLookup()
 
-model_type <- 'xgbDART'
+model_type <- 'lm'
 
 # Run a regression model on the training data
 model_fit <- caret::train(
@@ -277,7 +278,7 @@ model_fit <- caret::train(
   trControl = caret::trainControl(method = 'cv', number = 5)
 ) |> suppressWarnings()
 
-# See how well the model predicts the remaining 20% of data
+# Get in-sample and out-of-sample predictions based on the model
 training_data$in_sample <- predict(model_fit, newdata = training_data) |> suppressWarnings()
 test_data$predictions <- predict(model_fit, newdata = test_data) |> suppressWarnings()
 
@@ -285,7 +286,7 @@ test_data$predictions <- predict(model_fit, newdata = test_data) |> suppressWarn
 is_r_squared <- cor(training_data$pop_density, training_data$in_sample)**2
 is_rmse <- (training_data$pop_density - training_data$in_sample)**2 |> mean(na.rm=T) |> sqrt()
 
-# Get out-of-sample predictive metrics
+# Get out-of-sample predictive metrics (our gold standard for performance)
 oos_r_squared <- cor(test_data$pop_density, test_data$predictions)**2
 oos_rmse <- (test_data$pop_density - test_data$predictions)**2 |> mean(na.rm = T) |> sqrt()
 message(
@@ -300,7 +301,7 @@ message(
 results_plot <- ggplot(data = test_data, aes(x = pop_density, y = predictions)) +
   geom_point(aes(color = L_HOOD)) +
   geom_abline(intercept = 0, slope = 1, color = '#222222', linetype = 3, linewidth = 1) +
-  geom_smooth(method = 'loess', span = .3) +
+  geom_smooth(method = 'loess') +
   scale_x_continuous(trans = 'sqrt', labels = scales::comma) +
   scale_y_continuous(trans = 'sqrt', labels = scales::comma) +
   labs(
