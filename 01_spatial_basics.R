@@ -88,13 +88,14 @@ seattle_destination_points <- sf::st_as_sf(
   crs = sf::st_crs('EPSG:4326')
 ) |>
   sf::st_transform(crs = working_crs) |>
-  sf::st_intersection(y = seattle_neighborhoods[, c('L_HOOD', 'S_HOOD')])
+  sf::st_intersection(y = seattle_neighborhoods[, c('L_HOOD', 'S_HOOD')]) |>
+  suppressWarnings()
 
 # Crop census blocks to Seattle only
 seattle_blocks <- sf::st_intersection(
   x = kc_blocks,
   y = seattle_neighborhoods[, c('L_HOOD', 'S_HOOD')]
-)
+) |> suppressWarnings()
 
 # Inspect the Seattle blocks object
 View(seattle_blocks)
@@ -164,10 +165,13 @@ dev.off()
 
 ## Let's run a simple machine learning model to predict population density -------------->
 
+# Include only populated blocks for this test
+block_centroids <- sf::st_centroid(seattle_blocks, of_largest_polygon = TRUE)
+block_centroids <- block_centroids[block_centroids$total_pop > 0, ]
+block_centroids$id <- seq_len(nrow(block_centroids))
+
 # Get geographic distances (as the crow flies) from the center of each block to nearest
 #  features
-block_centroids <- sf::st_centroid(seattle_blocks, of_largest_polygon = TRUE)
-
 split_by_feature <- list(
   restaurants = seattle_destination_points[seattle_destination_points$type == 'Restaurants', ],
   coffee = seattle_destination_points[seattle_destination_points$type == 'Coffee shops', ],
@@ -184,19 +188,59 @@ for(feature_type in c('restaurants','coffee','supermarkets')){
     x = block_centroids,
     y = destination_subset[nearest_index, ],
     by_element = TRUE
-  )
+  ) |> units::set_units('m') |> units::drop_units()
 }
 
 # Get latitude and longitude of each block centroid
-block_centroids_unprojected <- sf::st_transform(block_centroids, crs = sf::st_crs('EPSG:4326'))
-block_centroids_unprojected$x <- sf::st_coordinates(block_centroids_unprojected)[, 'X']
-block_centroids_unprojected$y <- sf::st_coordinates(block_centroids_unprojected)[, 'Y']
+block_centroids_latlong <- block_centroids |>
+  sf::st_transform(crs = sf::st_crs('EPSG:4326')) |>
+  sf::st_coordinates()
+block_centroids$x <- block_centroids_latlong[, 'X']
+block_centroids$y <- block_centroids_latlong[, 'Y']
+
+
+# Get (approximate) average population density across neighboring blocks
+block_buffers <- sf::st_buffer(block_centroids[, 'id'], dist = units::set_units(100, 'm'))
+nearby_blocks <- sf::st_join(
+  x = block_centroids[, c('id','total_pop','area_km2')],
+  y = block_buffers,
+  join = st_intersects
+) |> as.data.frame()
+nearby_blocks$geom <- NULL
+nearby_blocks <- nearby_blocks[nearby_blocks$id.x != nearby_blocks$id.y, ]
+nearby_summed <- aggregate(
+  x = list(total_pop = nearby_blocks$total_pop, area_km2 = nearby_blocks$area_km2),
+  by = list(id = nearby_blocks$id.y),
+  FUN = sum
+)
+nearby_summed$neighboring_density <- nearby_summed$total_pop / nearby_summed$area_km2
+block_centroids <- merge(
+  x = block_centroids,
+  y = nearby_summed[, c('id', 'neighboring_density')],
+  by = c('id')
+)
+
+# Prepare the analysis dataset
+full_dataset <- as.data.frame(block_centroids)
+full_dataset$geometry <- NULL
+
+# Normalize all numeric predictors
+numeric_predictors <- c('x','y','restaurants','coffee','supermarkets','neighboring_density')
+for(var in numeric_predictors){
+  full_dataset[[var]] <- (
+    (full_dataset[[var]] - mean(full_dataset[[var]])) / sd(full_dataset[[var]])
+  )
+}
+
+# Split the L_HOOD variable into dummy variables (0/1) by large neighborhood
+full_dataset$LH_ <- make.names(full_dataset$L_HOOD)
+neighborhood_model_matrix <- stats::model.matrix(~ 0 + LH_, data = full_dataset) |>
+  as.data.frame()
+full_dataset <- cbind(full_dataset, neighborhood_model_matrix)
+all_predictors <- c(numeric_predictors, colnames(neighborhood_model_matrix))
+predictors_formula <- paste('pop_density ~', paste(all_predictors, collapse = ' + '))
 
 # Split into training and test datasets
-# Include only populated blocks for this example
-full_dataset <- as.data.frame(block_centroids_unprojected)
-full_dataset <- full_dataset[full_dataset$pop_density > 0, ]
-
 train_index <- caret::createDataPartition(full_dataset$L_HOOD, p = .8, list = F, times = 1)
 training_data <- full_dataset[train_index, ]
 test_data <- full_dataset[-train_index, ]
@@ -206,47 +250,64 @@ test_data <- full_dataset[-train_index, ]
 
 # For more information about regression models available in caret:
 # https://topepo.github.io/caret/available-models.html
-model_options <- list(
-  lm = list(),
-  enet = list(lambda = 0.25),
-  svmRadial = list(sigma = 0.1),
-  xgbTree = list(nrounds = 4, max_depth = 2, eta = 0.7),
-  rf = list(mtry = 5)
-)
-# Try also: 'enet', 'svmRadial', 'xgbTree', 'rf'
-test_model_type <- 'lm'
+#
+# Some model options, approximately ordered by run times:
+#   - 'lm': Linear regression
+#   - 'ridge', 'enet': Penalized regression
+#   - 'rpart': Regression trees
+#   - 'glm': Generalized linear models
+#   - 'gam': Generalized additive model
+#   - 'gbm': Stochastic gradient boosting
+#   - 'treebag': Bagged regression trees
+#   - 'svmLinear', 'svmLinear2', 'svmPoly', 'svmRadial': support vector machines
+#   - 'xgbLinear', 'xgbDART', 'xgbTree': XGBoost
+#   - 'rf': Random forest
+#   - 'bstTree': Boosted regression trees
+#
+# Some models have tuning parameters where you can override the defaults. For more
+#  information, see caret::modelLookup()
+
+model_type <- 'xgbDART'
 
 # Run a regression model on the training data
-model_fit <- do.call(
-  what = caret::train,
-  args = c(
-    list(
-      form = pop_density ~ x + y + restaurants + coffee + supermarkets + L_HOOD,
-      data = training_data,
-      method = test_model_type
-    ),
-    model_options[[test_model_type]]
-  )
-)
+model_fit <- caret::train(
+  form = as.formula(predictors_formula),
+  data = training_data,
+  method = model_type,
+  trControl = caret::trainControl(method = 'cv', number = 5)
+) |> suppressWarnings()
 
 # See how well the model predicts the remaining 20% of data
-test_data$predictions <- predict(model_fit, newdata = test_data)
+training_data$in_sample <- predict(model_fit, newdata = training_data) |> suppressWarnings()
+test_data$predictions <- predict(model_fit, newdata = test_data) |> suppressWarnings()
 
-r_squared <- cor(test_data$pop_density, test_data$predictions)
-rmse <- (test_data$pop_density - test_data$predictions)**2 |> mean(na.rm = T) |> sqrt()
+# Get in-sample predictive metrics
+is_r_squared <- cor(training_data$pop_density, training_data$in_sample)**2
+is_rmse <- (training_data$pop_density - training_data$in_sample)**2 |> mean(na.rm=T) |> sqrt()
+
+# Get out-of-sample predictive metrics
+oos_r_squared <- cor(test_data$pop_density, test_data$predictions)**2
+oos_rmse <- (test_data$pop_density - test_data$predictions)**2 |> mean(na.rm = T) |> sqrt()
+message(
+  "Model performance for ", model_type, ": ",
+  "\n  In-sample RMSE: ", round(is_rmse, 0),
+  "\n  In-sample R-squared: ", round(is_r_squared, 3),
+  "\n  Out-of-sample RMSE: ", round(oos_rmse, 0),
+  "\n  Out-of-sample R squared: ", round(oos_r_squared, 3)
+)
 
 # Plot the results
-results_plot <- ggplot(data = test_data, aes(x = predictions, y = pop_density)) +
+results_plot <- ggplot(data = test_data, aes(x = pop_density, y = predictions)) +
   geom_point(aes(color = L_HOOD)) +
   geom_abline(intercept = 0, slope = 1, color = '#222222', linetype = 3, linewidth = 1) +
   geom_smooth(method = 'loess', span = .3) +
   scale_x_continuous(trans = 'sqrt', labels = scales::comma) +
   scale_y_continuous(trans = 'sqrt', labels = scales::comma) +
   labs(
-    title = paste('Out-of-sample performance for model type:', toupper(test_model_type)),
-    subtitle = paste('RMSE:', scales::comma(rmse), '| R-squared:', round(r_squared, 2)),
-    x = 'Population density (predicted)',
-    y = 'Population density (actual)',
+    title = paste('Out-of-sample performance for model type:', toupper(model_type)),
+    subtitle = paste('RMSE:', scales::comma(oos_rmse), '| R-squared:', round(oos_r_squared, 3)),
+    x = 'Population density (actual)',
+    y = 'Population density (OOS predictions)',
     color = 'Neighborhood'
   ) +
   guides(color = guide_legend(ncol = 2)) +
