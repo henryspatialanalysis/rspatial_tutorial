@@ -1,0 +1,8 @@
+/*
+Example Overpass query that can be run at http://overpass-turbo.eu
+or using API tools like the "overpass" R package, https://github.com/hrbrmstr/overpass
+*/
+[out:json][bbox:47.41,-122.48,47.79,-122.16];(
+  nwr[leisure=dog_park];
+);
+out skel center;
